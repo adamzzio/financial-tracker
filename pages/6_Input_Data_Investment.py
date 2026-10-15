@@ -127,7 +127,7 @@ try:
         terakhir = pd.read_sql(
             select(tabel)
             .where(tabel.c.account_id == account_id)
-            .order_by(tabel.c.id.desc())
+            .order_by(tabel.c.investment_date.desc(), tabel.c.id.desc())
             .limit(10),
             conn,
         )
