@@ -24,8 +24,23 @@ if account_id is None:
     st.error("Akun ini belum terdaftar pada mapping account_id.")
     st.stop()
 
-TABLE_NAME = "master_investment"
 FLOW = "Investment"
+
+# Pemetaan jenis transaksi ke tabel dan nama kolomnya
+JENIS = {
+    "Investment": {
+        "tabel": "master_investment",
+        "item": "investment",
+        "amount": "investment_amount",
+        "date": "investment_date",
+    },
+    "Outvestment": {
+        "tabel": "master_outvestment",
+        "item": "outvestment",
+        "amount": "outvestment_amount",
+        "date": "outvestment_date",
+    },
+}
 
 
 # ---------- Data platform & investasi ----------
@@ -51,15 +66,24 @@ if kategori_df.empty:
 
 # ---------- Header ----------
 st.title("📈 Input Data Investment")
-st.caption("Catat investasi baru. Data akan tersimpan ke tabel `master_investment`.")
 
 if "investment_ver" not in st.session_state:
     st.session_state["investment_ver"] = 0
 v = st.session_state["investment_ver"]
 
 # ---------- Form input ----------
-# Widget sengaja tidak memakai st.form agar investment bisa menyesuaikan platform secara langsung
+# Widget sengaja tidak memakai st.form agar pilihan dependen bisa menyesuaikan secara langsung
 with st.container(border=True):
+    jenis = st.selectbox(
+        "Jenis Transaksi",
+        list(JENIS),
+        index=0,
+        key="inv_jenis",  # tanpa versi, agar pilihan tetap setelah simpan
+        help="Investment: dana masuk ke investasi. Outvestment: dana ditarik dari investasi.",
+    )
+    cfg = JENIS[jenis]
+    st.caption(f"Data akan tersimpan ke tabel `{cfg['tabel']}`.")
+
     c1, c2 = st.columns(2)
 
     daftar_platform = sorted(kategori_df["platform"].unique())
@@ -80,11 +104,11 @@ with st.container(border=True):
 
     c3, c4 = st.columns(2)
     amount = c3.number_input(
-        "Investment Amount (Rp)", min_value=0, step=1000, value=None,
+        f"{jenis} Amount (Rp)", min_value=0, step=1000, value=None,
         format="%d", placeholder="Contoh: 1000000", key=f"inv_amt_{v}",
     )
     tanggal = c4.date_input(
-        "Investment Date", value=None, format="DD/MM/YYYY",
+        f"{jenis} Date", value=None, format="DD/MM/YYYY",
         help="Kosongkan untuk memakai tanggal hari ini.", key=f"inv_date_{v}",
     )
 
@@ -98,43 +122,60 @@ if simpan:
     if not platform or not investment:
         st.warning("Platform dan Investment wajib dipilih.")
     elif not amount or amount <= 0:
-        st.warning("Investment Amount wajib diisi dan lebih dari 0.")
+        st.warning(f"{jenis} Amount wajib diisi dan lebih dari 0.")
     else:
-        investment_date = tanggal or datetime.now(ZoneInfo("Asia/Jakarta")).date()
+        tanggal_simpan = tanggal or datetime.now(ZoneInfo("Asia/Jakarta")).date()
         try:
-            tabel = get_table(TABLE_NAME)
+            tabel = get_table(cfg["tabel"])
             with get_engine().begin() as conn:
                 conn.execute(
                     insert(tabel).values(
-                        account_id=account_id,
-                        platform=platform,
-                        investment=investment,
-                        investment_amount=int(amount),
-                        investment_date=investment_date,
+                        **{
+                            "account_id": account_id,
+                            "platform": platform,
+                            cfg["item"]: investment,
+                            cfg["amount"]: int(amount),
+                            cfg["date"]: tanggal_simpan,
+                        }
                     )
                 )
             st.session_state["investment_ver"] += 1  # reset form
-            st.toast("Data investment berhasil disimpan.", icon="✅")
+            st.toast(f"Data {jenis.lower()} berhasil disimpan.", icon="✅")
             st.rerun()
         except SQLAlchemyError as e:
             st.error(f"Gagal menyimpan: {e}")
 
 # ---------- Riwayat input ----------
-st.subheader("10 Input Terakhir")
+st.subheader("10 Transaksi Terakhir")
+
+QUERY_RIWAYAT = text(
+    """
+    SELECT * FROM (
+        SELECT id, account_id, 'Investment' AS "Flow", platform,
+               investment AS "Category",
+               investment_amount AS "Amount",
+               investment_date AS "Date"
+        FROM master_investment
+        UNION ALL
+        SELECT id, account_id, 'Outvestment', platform,
+               outvestment,
+               outvestment_amount,
+               outvestment_date
+        FROM master_outvestment
+    ) t
+    WHERE account_id = :account_id
+    ORDER BY "Date" DESC, id DESC
+    LIMIT 10
+    """
+)
+
 try:
-    tabel = get_table(TABLE_NAME)
     with get_engine().connect() as conn:
-        terakhir = pd.read_sql(
-            select(tabel)
-            .where(tabel.c.account_id == account_id)
-            .order_by(tabel.c.investment_date.desc(), tabel.c.id.desc())
-            .limit(10),
-            conn,
-        )
+        terakhir = pd.read_sql(QUERY_RIWAYAT, conn, params={"account_id": account_id})
     if terakhir.empty:
         st.caption("Belum ada data.")
     else:
-        terakhir["investment_amount"] = terakhir["investment_amount"].apply(rupiah)
+        terakhir["Amount"] = terakhir["Amount"].apply(rupiah)
         st.dataframe(terakhir, hide_index=True, use_container_width=True)
 except Exception as e:
-    st.error(f"Gagal membaca tabel `{TABLE_NAME}`: {e}")
+    st.error(f"Gagal membaca tabel `master_investment` dan `master_outvestment`: {e}")
