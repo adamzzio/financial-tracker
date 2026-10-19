@@ -11,6 +11,7 @@ from sqlalchemy import text
 from utils.auth import get_account_id, has_role, render_sidebar, require_login
 from utils.db import get_engine
 from utils.formatting import BULAN_SINGKAT, rupiah
+from utils.periode import render_filter_periode, terapkan_periode
 
 st.set_page_config(page_title="Dashboard Overall | FinTrack", page_icon="📊", layout="wide")
 
@@ -78,19 +79,8 @@ st.caption(
     "Ringkasan seluruh akun." if is_admin else f"Ringkasan keuangan milik {user['name']}."
 )
 
-kol_filter, _ = st.columns([1, 3])
-pilihan = kol_filter.selectbox(
-    "Periode",
-    list(PERIODE),
-    index=0,
-    help="Periode dihitung mundur dari hari ini, contoh: 3 Bulan Terakhir = 3 bulan ke belakang.",
-)
-n_bulan = PERIODE[pilihan]
-
-hari_ini = pd.Timestamp(datetime.now(ZoneInfo("Asia/Jakarta")).date())
-df = semua.copy()
-if n_bulan:
-    df = df[df["tanggal"] >= hari_ini - pd.DateOffset(months=n_bulan)]
+n_bulan = render_filter_periode()
+df = terapkan_periode(semua, "tanggal", n_bulan)
 
 if df.empty:
     st.info("Belum ada data transaksi pada periode ini.")
