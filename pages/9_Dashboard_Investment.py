@@ -1,6 +1,3 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -18,13 +15,8 @@ render_sidebar(user)
 
 INV_DARURAT = "Dana Darurat"
 INV_WEDDING = "Wedding"
-PERIODE = {
-    "All": None,
-    "1 Bulan Terakhir": 1,
-    "3 Bulan Terakhir": 3,
-    "6 Bulan Terakhir": 6,
-    "12 Bulan Terakhir": 12,
-}
+TARGET_DARURAT = 30_000_000
+TARGET_WEDDING = 20_000_000
 
 # ---------- Scope akun ----------
 # Admin melihat semua akun, user lain hanya akunnya sendiri
@@ -54,10 +46,28 @@ def load_investment(account_id: int | None) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_outvestment(account_id: int | None) -> pd.DataFrame:
+    query = (
+        "SELECT id, account_id, platform, outvestment, outvestment_amount, outvestment_date "
+        "FROM master_outvestment"
+    )
+    params = {}
+    if account_id is not None:
+        query += " WHERE account_id = :account_id"
+        params["account_id"] = account_id
+    with get_engine().connect() as conn:
+        df = pd.read_sql(text(query), conn, params=params)
+    df["outvestment_date"] = pd.to_datetime(df["outvestment_date"])
+    df["outvestment_amount"] = pd.to_numeric(df["outvestment_amount"]).fillna(0)
+    return df
+
+
 try:
-    semua = load_investment(account_id)
+    semua_inv = load_investment(account_id)
+    semua_out = load_outvestment(account_id)
 except Exception as e:
-    st.error(f"Gagal membaca tabel `master_investment`: {e}")
+    st.error(f"Gagal membaca tabel `master_investment` atau `master_outvestment`: {e}")
     st.stop()
 
 # ---------- Header & filter ----------
@@ -67,13 +77,57 @@ st.caption(
 )
 
 n_bulan = render_filter_periode()
-df = terapkan_periode(semua, "investment_date", n_bulan)
+df = terapkan_periode(semua_inv, "investment_date", n_bulan)
+df_out = terapkan_periode(semua_out, "outvestment_date", n_bulan)
 
-if df.empty:
+
+# ---------- Tabel 10 transaksi terakhir ----------
+def tampil_riwayat() -> None:
+    """10 transaksi terakhir: gabungan master_investment dan master_outvestment (UNION ALL)."""
+    st.subheader("10 Transaksi Investment Terakhir")
+
+    kolom = ["account_id", "Flow", "platform", "Category", "Amount", "Date"]
+
+    inv = df.rename(
+        columns={
+            "investment": "Category",
+            "investment_amount": "Amount",
+            "investment_date": "Date",
+        }
+    ).assign(Flow="Investment")
+
+    out = df_out.rename(
+        columns={
+            "outvestment": "Category",
+            "outvestment_amount": "Amount",
+            "outvestment_date": "Date",
+        }
+    ).assign(Flow="Outvestment")
+
+    # UNION ALL kedua tabel
+    bagian = [x[["id"] + kolom] for x in (inv, out) if not x.empty]
+    if not bagian:
+        st.caption("Belum ada data.")
+        return
+    gabungan = pd.concat(bagian, ignore_index=True)
+
+    # Sort Date DESCENDING (id sebagai pemisah jika tanggal sama)
+    tabel = gabungan.sort_values(["Date", "id"], ascending=False).head(10).copy()
+    tabel["Date"] = tabel["Date"].dt.strftime("%d-%m-%Y")
+    tabel["Amount"] = tabel["Amount"].apply(rupiah)
+
+    tampil = ["Flow", "platform", "Category", "Amount", "Date"]
+    if is_admin:
+        tampil.insert(0, "account_id")
+    tabel = tabel[tampil].rename(columns={"account_id": "Account ID", "platform": "Platform"})
+    st.dataframe(tabel, hide_index=True, use_container_width=True)
+
+
+if df.empty and df_out.empty:
     st.info("Belum ada data investment pada periode ini.")
     st.stop()
 
-# ---------- Card ----------
+# ---------- Agregasi card ----------
 total_all = df["investment_amount"].sum()
 total_darurat = df.loc[df["investment"] == INV_DARURAT, "investment_amount"].sum()
 total_wedding = df.loc[df["investment"] == INV_WEDDING, "investment_amount"].sum()
@@ -81,25 +135,69 @@ total_other = df.loc[
     ~df["investment"].isin([INV_DARURAT, INV_WEDDING]), "investment_amount"
 ].sum()
 
+total_out = df_out["outvestment_amount"].sum()
+total_sisa = total_all - total_out
+usage_rate = f"{total_out / total_all * 100:.1f}%" if total_all else "N/A"
+
+
+def tampil_target(nilai: float, target: int) -> None:
+    """Progress bar capaian terhadap target (bar maksimal 100%, teks tetap menampilkan nilai asli)."""
+    pct = nilai / target * 100
+    st.progress(min(pct / 100, 1.0), text=f"{pct:.1f}% dari target {rupiah(target)}")
+
+
+# ---------- Row 1: card investment ----------
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Total All Investment", rupiah(total_all), help="SUM investment_amount seluruh investment.")
-k2.metric(
-    "Total Emergency Fund",
-    rupiah(total_darurat),
-    help="SUM investment_amount dengan investment = 'Dana Darurat'.",
-)
-k3.metric(
-    "Total Wedding",
-    rupiah(total_wedding),
-    help="SUM investment_amount dengan investment = 'Wedding'.",
-)
+
+with k2:
+    st.metric(
+        "Total Emergency Fund",
+        rupiah(total_darurat),
+        help=f"SUM investment_amount dengan investment = '{INV_DARURAT}'. "
+        f"Target: {rupiah(TARGET_DARURAT)}.",
+    )
+    tampil_target(total_darurat, TARGET_DARURAT)
+
+with k3:
+    st.metric(
+        "Total Wedding",
+        rupiah(total_wedding),
+        help=f"SUM investment_amount dengan investment = '{INV_WEDDING}'. "
+        f"Target: {rupiah(TARGET_WEDDING)}.",
+    )
+    tampil_target(total_wedding, TARGET_WEDDING)
+
 k4.metric(
     "Total Other Investment",
     rupiah(total_other),
-    help="SUM investment_amount dengan investment selain 'Dana Darurat' dan 'Wedding'.",
+    help=f"SUM investment_amount dengan investment selain '{INV_DARURAT}' dan '{INV_WEDDING}'.",
+)
+
+# ---------- Row 2: card outvestment ----------
+o1, o2, o3, _ = st.columns(4)
+o1.metric(
+    "Total Outvestment",
+    rupiah(total_out),
+    help="SUM outvestment_amount pada master_outvestment.",
+)
+o2.metric(
+    "Total Remaining Investment",
+    rupiah(total_sisa),
+    help="Total All Investment dikurangi Total Outvestment.",
+)
+o3.metric(
+    "Investment Usage Rate",
+    usage_rate,
+    help="Persentase investasi yang sudah digunakan: Total Outvestment / Total All Investment x 100.",
 )
 
 st.divider()
+
+if df.empty:
+    st.info("Belum ada data investment pada periode ini, sehingga chart tidak ditampilkan.")
+    tampil_riwayat()
+    st.stop()
 
 
 # ---------- Helper ----------
@@ -190,23 +288,4 @@ with c4:
     st.plotly_chart(rapikan(fig), use_container_width=True)
 
 # ---------- Tabel 10 transaksi terakhir ----------
-st.subheader("10 Transaksi Investment Terakhir")
-kolom_tabel = ["investment_date", "platform", "investment", "investment_amount"]
-if is_admin:
-    kolom_tabel.insert(0, "account_id")
-
-terakhir = (
-    df.sort_values(["investment_date", "id"], ascending=False).head(10)[kolom_tabel].copy()
-)
-terakhir["investment_date"] = terakhir["investment_date"].dt.strftime("%d-%m-%Y")
-terakhir["investment_amount"] = terakhir["investment_amount"].apply(rupiah)
-terakhir = terakhir.rename(
-    columns={
-        "account_id": "Account ID",
-        "investment_date": "Tanggal",
-        "platform": "Platform",
-        "investment": "Investment",
-        "investment_amount": "Nominal",
-    }
-)
-st.dataframe(terakhir, hide_index=True, use_container_width=True)
+tampil_riwayat()
